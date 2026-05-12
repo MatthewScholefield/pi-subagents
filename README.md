@@ -1,6 +1,6 @@
 # @tintinweb/pi-subagents
 
-A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in foreground or background, steer them mid-run, resume completed sessions, and define your own custom agent types.
+A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, and model behavior. Define your own custom agent types and run multiple agents in parallel when needed.
 
 > **Status:** Early release.
 
@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
-- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
+- **Parallel agent calls** — emit multiple `Agent` calls in the same assistant turn and they run concurrently (configurable concurrency limit, default 4)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause)
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
@@ -30,7 +30,6 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on load
-- **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 
 ## Install
 
@@ -46,50 +45,17 @@ pi -e ./src/index.ts
 
 ## Quick Start
 
-The parent agent spawns sub-agents using the `Agent` tool:
+Use the `Agent` tool to spawn a sub-agent:
 
 ```
 Agent({
   subagent_type: "Explore",
   prompt: "Find all files that handle authentication",
-  description: "Find auth files",
-  run_in_background: true,
+  short_description: "Find auth files",
 })
 ```
 
-Foreground agents block until complete and return results inline. Background agents return an ID immediately and notify you on completion.
-
-### Scheduling
-
-Add a `schedule` field to register the agent to fire later instead of running now:
-
-```
-Agent({
-  subagent_type: "Explore",
-  prompt: "Look at recent commits and summarize what changed since last week",
-  description: "Weekly commit review",
-  schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
-})
-```
-
-Schedule formats:
-
-- **Cron** — 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes.
-- **Interval** — `"5m"`, `"1h"`, `"30s"`, `"2d"`. Fires repeatedly at that interval.
-- **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
-- **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
-
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
-
-Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
-
-**Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
-
-Restrictions:
-- `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
-- `run_in_background` is forced to `true`.
-- Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
-- **Headless `pi -p` doesn't wait for scheduled subagents.**
+Agent calls run to completion inline. If you need multiple independent agents, emit multiple `Agent` calls in the same assistant turn and they will run in parallel.
 
 ## UI
 
@@ -139,7 +105,7 @@ Group completions render each agent as a separate block. The LLM receives struct
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
-| `Explore` | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace` (standalone) | Fast codebase exploration (read-only) |
+| `Explore` | read, bash, grep, find, ls | gpt-5.4-mini (fast) | `replace` (standalone) | Fast codebase exploration with a smaller, faster model (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
@@ -182,7 +148,7 @@ Report findings with file paths, line numbers, severity, and remediation advice.
 Then spawn it like any built-in type:
 
 ```
-Agent({ subagent_type: "auditor", prompt: "Review the auth module", description: "Security audit" })
+Agent({ subagent_type: "auditor", prompt: "Review the auth module", short_description: "Security audit" })
 ```
 
 ### Frontmatter Fields
@@ -208,7 +174,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | No extension/MCP tools, only built-in |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. The `Agent` tool only supplies `subagent_type`, `prompt`, and `short_description`.
 
 ## Tools
 
@@ -218,21 +184,13 @@ Launch a sub-agent.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `subagent_type` | string | no | Agent type (built-in or custom). Defaults to `general-purpose` |
 | `prompt` | string | yes | The task for the agent |
-| `description` | string | yes | Short 3-5 word summary (shown in UI) |
-| `subagent_type` | string | yes | Agent type (built-in or custom) |
-| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`) |
-| `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh |
-| `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
-| `run_in_background` | boolean | no | Run without blocking |
-| `resume` | string | no | Agent ID to resume a previous session |
-| `isolated` | boolean | no | No extension/MCP tools |
-| `isolation` | `"worktree"` | no | Run in an isolated git worktree |
-| `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `short_description` | string | yes | Short 3-5 word summary (shown in UI) |
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent.
+Check status and retrieve results from an agent by ID.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -443,17 +401,19 @@ The `disallowed_tools` field is respected when determining write capability — 
 
 ## Worktree Isolation
 
-Set `isolation: worktree` to run an agent in a temporary git worktree:
+Set `isolation: worktree` in an agent's frontmatter to run it in a temporary git worktree:
 
-```
-Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
+```yaml
+---
+isolation: worktree
+---
 ```
 
 The agent gets a full, isolated copy of the repository. On completion:
 - **No changes:** worktree is cleaned up automatically
 - **Changes made:** changes are committed to a new branch (`pi-agent-<id>`) and returned in the result
 
-If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` tool returns a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. Initialize git and commit at least once, or omit `isolation`.
+If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the agent run returns a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. Initialize git and commit at least once, or omit `isolation`.
 
 ## Skill Preloading
 

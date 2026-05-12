@@ -30,7 +30,7 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
     {
       name: "Explore",
       displayName: "Explore",
-      description: "Fast codebase exploration agent (read-only)",
+      description: "Fast, lightweight codebase exploration agent (read-only)",
       builtinToolNames: READ_ONLY_TOOLS,
       extensions: true,
       skills: true,

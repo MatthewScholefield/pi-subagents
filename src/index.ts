@@ -617,112 +617,39 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Agent tool ----
 
-  // Schedule param + its guideline are gated on `schedulingEnabled` (read once
-  // at registration; flipping the setting later requires next pi session for
-  // the schema to update). Defining the shape once and spreading it via Partial
-  // preserves Type.Object's inference when present and produces a
-  // `schedule`-free schema when absent — zero LLM-context cost in disabled mode.
-  const scheduleParamShape = {
-    schedule: Type.Optional(
-      Type.String({
-        description:
-          'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
-          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
-          'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
-      }),
-    ),
-  };
-  const scheduleParam: Partial<typeof scheduleParamShape> =
-    isSchedulingEnabled() ? scheduleParamShape : {};
-
-  const scheduleGuideline = isSchedulingEnabled()
-    ? `\n- Use \`schedule\` only when the user explicitly asked for scheduled / recurring / delayed execution (e.g. "every Monday", "in an hour"). Don't auto-schedule from vague intent like "monitor X" — run once now or ask.`
-    : "";
 
   pi.registerTool(defineTool({
     name: "Agent",
     label: "Agent",
     description: `Launch a new agent to handle complex, multi-step tasks autonomously.
 
-The Agent tool launches specialized agents that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
-
 Available agent types:
 ${typeListText}
 
 Guidelines:
-- For parallel work, use run_in_background: true on each agent. Foreground calls run sequentially — only one executes at a time.
 - Use Explore for codebase searches and code understanding.
 - Use Plan for architecture and implementation planning.
 - Use general-purpose for complex tasks that need file editing.
-- Provide clear, detailed prompts so the agent can work autonomously.
-- Agent results are returned as text — summarize them for the user.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes.
-- Use resume with an agent ID to continue a previous agent's work.
-- Use steer_subagent to send mid-run messages to a running background agent.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications).${scheduleGuideline}`,
+- If you need several independent sub-agents, create multiple Agent calls in the same assistant turn; they will run in parallel.
+- Keep prompts clear and self-contained.
+- Agent results are returned as text — summarize them for the user.`,
     parameters: Type.Object({
+      subagent_type: Type.Optional(Type.String({
+        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available. Defaults to general-purpose.`,
+      })),
       prompt: Type.String({
         description: "The task for the agent to perform.",
       }),
-      description: Type.String({
+      short_description: Type.String({
         description: "A short (3-5 word) description of the task (shown in UI).",
       }),
-      subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-      }),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.String({
-          description: "Thinking level: off, minimal, low, medium, high, xhigh. Overrides agent default.",
-        }),
-      ),
-      max_turns: Type.Optional(
-        Type.Number({
-          description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
-          minimum: 1,
-        }),
-      ),
-      run_in_background: Type.Optional(
-        Type.Boolean({
-          description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
-        }),
-      ),
-      resume: Type.Optional(
-        Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context.",
-        }),
-      ),
-      isolated: Type.Optional(
-        Type.Boolean({
-          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
-        }),
-      ),
-      inherit_context: Type.Optional(
-        Type.Boolean({
-          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
-        }),
-      ),
-      isolation: Type.Optional(
-        Type.Literal("worktree", {
-          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
-        }),
-      ),
-      ...scheduleParam,
     }),
 
     // ---- Custom rendering: Claude Code style ----
 
     renderCall(args, theme) {
-      const displayName = args.subagent_type ? getDisplayName(args.subagent_type) : "Agent";
-      const desc = args.description ?? "";
+      const displayName = getDisplayName(args.subagent_type ?? "general-purpose");
+      const desc = args.short_description ?? "";
       return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
     },
 
@@ -817,7 +744,7 @@ Guidelines:
       // Reload custom agents so new .pi/agents/*.md files are picked up without restart
       reloadCustomAgents();
 
-      const rawType = params.subagent_type as SubagentType;
+      const rawType = (params.subagent_type as SubagentType | undefined) ?? "general-purpose";
       const resolved = resolveType(rawType);
       const subagentType = resolved ?? "general-purpose";
       const fellBack = resolved === undefined;
@@ -827,16 +754,13 @@ Guidelines:
       // Get agent config (if any)
       const customConfig = getAgentConfig(subagentType);
 
-      const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
+      const resolvedConfig = resolveAgentInvocationConfig(customConfig);
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
+      // Resolve model from agent config.
       let model = ctx.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
+        if (typeof resolved !== "string") {
           model = resolved;
         }
       }
@@ -860,74 +784,15 @@ Guidelines:
       if (isolated) agentTags.push("isolated");
       if (isolation === "worktree") agentTags.push("worktree");
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
+      const shortDescription = params.short_description;
       // Shared base fields for all AgentDetails in this call
       const detailBase = {
         displayName,
-        description: params.description,
+        description: shortDescription,
         subagentType,
         modelName: agentModelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
       };
-
-      // ---- Schedule: register a job, don't spawn now ----
-      if (params.schedule) {
-        if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
-        }
-        if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
-        }
-        if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
-        }
-        if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
-        }
-        if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
-        }
-        try {
-          const job = scheduler.addJob({
-            name: params.description as string,
-            description: params.description as string,
-            schedule: params.schedule as string,
-            subagent_type: subagentType,
-            prompt: params.prompt as string,
-            model: params.model as string | undefined,
-            thinking: thinking,
-            max_turns: effectiveMaxTurns,
-            isolated: isolated,
-            isolation: isolation,
-          });
-          const next = scheduler.getNextRun(job.id);
-          return textResult(
-            `Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
-            `Next run: ${next ?? "(unknown)"}. ` +
-            `Manage via /agents → Scheduled jobs.`,
-          );
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
-      }
-
-      // Resume existing agent
-      if (params.resume) {
-        const existing = manager.getRecord(params.resume);
-        if (!existing) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
-        }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
-        const record = await manager.resume(params.resume, params.prompt, signal);
-        if (!record) {
-          return textResult(`Failed to resume agent "${params.resume}".`);
-        }
-        return textResult(
-          record.result?.trim() || record.error?.trim() || "No output.",
-          buildDetails(detailBase, record),
-        );
-      }
 
       // Background execution
       if (runInBackground) {
@@ -948,7 +813,7 @@ Guidelines:
 
         try {
           id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
+            description: shortDescription,
             model,
             maxTurns: effectiveMaxTurns,
             isolated,
@@ -992,7 +857,7 @@ Guidelines:
         pi.events.emit("subagents:created", {
           id,
           type: subagentType,
-          description: params.description,
+          description: shortDescription,
           isBackground: true,
         });
 
@@ -1001,7 +866,7 @@ Guidelines:
           `Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
+          `Description: ${shortDescription}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
@@ -1061,7 +926,7 @@ Guidelines:
       let record: AgentRecord;
       try {
         record = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
-          description: params.description,
+          description: shortDescription,
           model,
           maxTurns: effectiveMaxTurns,
           isolated,
@@ -1114,7 +979,7 @@ Guidelines:
     name: "get_subagent_result",
     label: "Get Agent Result",
     description:
-      "Check status and retrieve results from a background agent. Use the agent ID returned by Agent with run_in_background.",
+      "Check status and retrieve results from an agent by ID.",
     parameters: Type.Object({
       agent_id: Type.String({
         description: "The agent ID to check.",
@@ -1844,8 +1709,8 @@ ${systemPrompt}
       const val = await ctx.ui.select(
         "Schedule subagent feature",
         [
-          "enabled — Agent tool accepts a `schedule` param; /agents → Scheduled jobs visible",
-          "disabled — `schedule` removed from Agent tool spec (no LLM-context cost); menu hidden",
+          "enabled — scheduling subsystem active; /agents → Scheduled jobs visible",
+          "disabled — scheduling subsystem disabled; menu hidden",
         ],
       );
       if (val) {
