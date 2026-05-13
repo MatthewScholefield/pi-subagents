@@ -264,6 +264,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
+  let shuttingDown = false;
 
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
@@ -273,10 +274,12 @@ export default function (pi: ExtensionAPI) {
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
     cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
+    const timer = setTimeout(() => {
       pendingNudges.delete(key);
       send();
-    }, delay));
+    }, delay);
+    timer.unref?.();
+    pendingNudges.set(key, timer);
   }
 
   function cancelNudge(key: string) {
@@ -370,6 +373,7 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    if (shuttingDown) return;
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
@@ -487,12 +491,19 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     unsubSpawnRpc();
     unsubStopRpc();
     unsubPingRpc();
     currentCtx = undefined;
     delete (globalThis as any)[MANAGER_KEY];
     scheduler.stop();
+    if (batchFinalizeTimer) {
+      clearTimeout(batchFinalizeTimer);
+      batchFinalizeTimer = undefined;
+    }
+    groupJoin.dispose();
+    widget.dispose();
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
@@ -847,6 +858,7 @@ Guidelines:
           // dispatched across multiple event loop ticks are captured together
           if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
           batchFinalizeTimer = setTimeout(finalizeBatch, 100);
+          batchFinalizeTimer.unref?.();
         }
 
         agentActivity.set(id, bgState);

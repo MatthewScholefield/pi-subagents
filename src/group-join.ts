@@ -77,6 +77,7 @@ export class GroupJoinManager {
       group.timeoutHandle = setTimeout(() => {
         this.onTimeout(group);
       }, timeout);
+      group.timeoutHandle.unref?.();
     }
 
     return 'held';

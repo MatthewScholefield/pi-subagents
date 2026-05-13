@@ -240,6 +240,7 @@ export class AgentWidget {
   ensureTimer() {
     if (!this.widgetInterval) {
       this.widgetInterval = setInterval(() => this.update(), 80);
+      this.widgetInterval.unref?.();
     }
   }
 
