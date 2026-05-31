@@ -22,6 +22,26 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
 /** Default max concurrent background agents. */
 const DEFAULT_MAX_CONCURRENT = 4;
 
+const TERMINAL_STATUSES = new Set<AgentRecord["status"]>(["completed", "steered", "aborted", "stopped", "error"]);
+
+function normalizeDependencies(dependsOn?: string[]): string[] | undefined {
+  const ids = [...new Set((dependsOn ?? []).map(id => id.trim()).filter(Boolean))];
+  return ids.length > 0 ? ids : undefined;
+}
+
+function withDependencyResults(prompt: string, dependencies: AgentRecord[]): string {
+  if (dependencies.length === 0) return prompt;
+  const dependencyText = dependencies.map(dep => {
+    const result = dep.result?.trim() || dep.error || "No output.";
+    return `<dependency id="${dep.id}" description="${escapeXml(dep.description)}" status="${dep.status}">\n${result}\n</dependency>`;
+  }).join("\n\n");
+  return `The following subagent dependencies completed before this task started. Use their results as context and do not repeat their work unless necessary.\n\n${dependencyText}\n\n---\n\n${prompt}`;
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 interface SpawnArgs {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
@@ -48,6 +68,8 @@ interface SpawnOptions {
   isolation?: IsolationMode;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
+  /** Agent IDs that must complete successfully before this agent starts. */
+  dependsOn?: string[];
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
@@ -101,6 +123,29 @@ export class AgentManager {
     return this.maxConcurrent;
   }
 
+  private getDependencyRecords(record: AgentRecord): AgentRecord[] {
+    return (record.dependsOn ?? []).map(id => this.agents.get(id)).filter((r): r is AgentRecord => Boolean(r));
+  }
+
+  private getDependencyError(record: AgentRecord): string | undefined {
+    for (const id of record.dependsOn ?? []) {
+      const dep = this.agents.get(id);
+      if (!dep) return `Dependency subagent not found: ${id}`;
+      if (dep.status === "error") return `Dependency subagent ${id} failed: ${dep.error ?? "unknown error"}`;
+      if (dep.status === "aborted" || dep.status === "stopped") return `Dependency subagent ${id} did not complete successfully (${dep.status})`;
+    }
+    return undefined;
+  }
+
+  private dependenciesReady(record: AgentRecord): boolean {
+    for (const id of record.dependsOn ?? []) {
+      const dep = this.agents.get(id);
+      if (!dep) return true;
+      if (!TERMINAL_STATUSES.has(dep.status)) return false;
+    }
+    return true;
+  }
+
   /**
    * Spawn an agent and return its ID immediately (for background use).
    * If the concurrency limit is reached, the agent is queued.
@@ -122,12 +167,18 @@ export class AgentManager {
       toolUses: 0,
       startedAt: Date.now(),
       abortController,
+      dependsOn: normalizeDependencies(options.dependsOn),
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: 0,
     };
     this.agents.set(id, record);
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
+
+    if (record.dependsOn?.length && !this.dependenciesReady(record)) {
+      this.queue.push({ id, args });
+      return id;
+    }
 
     if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
@@ -148,6 +199,9 @@ export class AgentManager {
 
   /** Actually start an agent (called immediately or from queue drain). */
   private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, options }: SpawnArgs) {
+    const dependencyError = this.getDependencyError(record);
+    if (dependencyError) throw new Error(dependencyError);
+    const effectivePrompt = withDependencyResults(prompt, this.getDependencyRecords(record));
     // Worktree isolation: try to create a temporary git worktree. Strict —
     // fail loud if not possible (no silent fallback to main tree). Done
     // BEFORE state mutation so a throw doesn't leave the record half-running.
@@ -178,7 +232,7 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
-    const promise = runAgent(ctx, type, prompt, {
+    const promise = runAgent(ctx, type, effectivePrompt, {
       pi,
       model: options.model,
       maxTurns: options.maxTurns,
@@ -285,19 +339,31 @@ export class AgentManager {
 
   /** Start queued agents up to the concurrency limit. */
   private drainQueue() {
-    while (this.queue.length > 0 && this.runningBackground < this.maxConcurrent) {
-      const next = this.queue.shift()!;
-      const record = this.agents.get(next.id);
-      if (!record || record.status !== "queued") continue;
-      try {
-        this.startAgent(next.id, record, next.args);
-      } catch (err) {
-        // Late failure (e.g. strict worktree-isolation) — surface on the record
-        // so the user/agent can see it via /agents, then keep draining.
-        record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt = Date.now();
-        this.onComplete?.(record);
+    let madeProgress = true;
+    while (madeProgress) {
+      madeProgress = false;
+      for (let i = 0; i < this.queue.length; i++) {
+        if (this.runningBackground >= this.maxConcurrent) return;
+        const next = this.queue[i]!;
+        const record = this.agents.get(next.id);
+        if (!record || record.status !== "queued") {
+          this.queue.splice(i--, 1);
+          continue;
+        }
+        if (record.dependsOn?.length && !this.dependenciesReady(record)) continue;
+        this.queue.splice(i, 1);
+        i--;
+        try {
+          this.startAgent(next.id, record, next.args);
+        } catch (err) {
+          // Late failure (e.g. strict worktree-isolation or failed dependency) — surface on the record
+          // so the user/agent can see it via /agents, then keep draining.
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+          this.onComplete?.(record);
+        }
+        madeProgress = true;
       }
     }
   }
@@ -313,7 +379,15 @@ export class AgentManager {
     prompt: string,
     options: Omit<SpawnOptions, "isBackground">,
   ): Promise<AgentRecord> {
-    const id = this.spawn(pi, ctx, type, prompt, { ...options, isBackground: false });
+    const dependencies = normalizeDependencies(options.dependsOn);
+    if (dependencies?.length) {
+      const pending = dependencies
+        .map(id => this.agents.get(id))
+        .filter((r): r is AgentRecord => r != null && !TERMINAL_STATUSES.has(r.status));
+      await Promise.allSettled(pending.map(r => r.promise).filter(Boolean));
+    }
+
+    const id = this.spawn(pi, ctx, type, prompt, { ...options, dependsOn: dependencies, isBackground: false });
     const record = this.agents.get(id)!;
     await record.promise;
     return record;

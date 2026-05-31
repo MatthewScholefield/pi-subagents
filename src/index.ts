@@ -642,6 +642,7 @@ Guidelines:
 - Use Plan for architecture and implementation planning.
 - Use general-purpose for complex tasks that need file editing.
 - If you need several independent sub-agents, create multiple Agent calls in the same assistant turn; they will run in parallel.
+- If one agent needs another agent's output, set depends_on to the prerequisite agent ID(s) instead of manually polling and re-prompting.
 - Keep prompts clear and self-contained.
 - Agent results are returned as text — summarize them for the user.`,
     parameters: Type.Object({
@@ -654,6 +655,9 @@ Guidelines:
       short_description: Type.String({
         description: "A short (3-5 word) description of the task (shown in UI).",
       }),
+      depends_on: Type.Optional(Type.Array(Type.String(), {
+        description: "Optional subagent IDs this agent depends on. The agent waits for them to finish successfully and receives their results as context before starting.",
+      })),
     }),
 
     // ---- Custom rendering: Claude Code style ----
@@ -796,6 +800,9 @@ Guidelines:
       if (isolation === "worktree") agentTags.push("worktree");
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const shortDescription = params.short_description;
+      const dependsOn = Array.isArray(params.depends_on)
+        ? params.depends_on.map(String).map(s => s.trim()).filter(Boolean)
+        : undefined;
       // Shared base fields for all AgentDetails in this call
       const detailBase = {
         displayName,
@@ -832,6 +839,7 @@ Guidelines:
             thinkingLevel: thinking,
             isBackground: true,
             isolation,
+            dependsOn,
             ...bgCallbacks,
           });
         } catch (err) {
@@ -880,7 +888,8 @@ Guidelines:
           `Type: ${displayName}\n` +
           `Description: ${shortDescription}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+          (dependsOn?.length ? `Depends on: ${dependsOn.join(", ")}\n` : "") +
+          (isQueued ? `Position: queued (waiting for dependencies or max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
           `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
@@ -946,6 +955,7 @@ Guidelines:
           thinkingLevel: thinking,
           isolation,
           signal,
+          dependsOn,
           ...fgCallbacks,
         });
       } catch (err) {

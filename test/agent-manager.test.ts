@@ -345,3 +345,67 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(runAgent).not.toHaveBeenCalled();
   });
 });
+
+describe("AgentManager — explicit dependencies", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose();
+  });
+
+  it("queues dependent background agents until dependencies complete and injects results", async () => {
+    manager = new AgentManager(undefined, 4);
+    const resolvers: Array<(value: any) => void> = [];
+    const prompts: string[] = [];
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, prompt) => {
+      prompts.push(prompt as string);
+      return new Promise(resolve => resolvers.push(resolve));
+    });
+
+    const depId = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first dep",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "general-purpose", "second", {
+      description: "child",
+      isBackground: true,
+      dependsOn: [depId],
+    });
+
+    expect(manager.getRecord(childId)!.status).toBe("queued");
+    expect(prompts).toEqual(["first"]);
+
+    resolvers[0]!({ responseText: "dep result", session: mockSession(), aborted: false, steered: false });
+    await manager.getRecord(depId)!.promise;
+
+    expect(manager.getRecord(childId)!.status).toBe("running");
+    expect(prompts[1]).toContain("dep result");
+    expect(prompts[1]).toContain("second");
+
+    resolvers[1]!({ responseText: "child result", session: mockSession(), aborted: false, steered: false });
+    await manager.getRecord(childId)!.promise;
+  });
+
+  it("fails dependent agents when a dependency fails", async () => {
+    let completed: AgentRecord | undefined;
+    manager = new AgentManager(r => { completed = r; }, 4);
+    vi.mocked(runAgent).mockRejectedValueOnce(new Error("boom"));
+
+    const depId = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first dep",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "general-purpose", "second", {
+      description: "child",
+      isBackground: true,
+      dependsOn: [depId],
+    });
+
+    await manager.getRecord(depId)!.promise;
+
+    const child = manager.getRecord(childId)!;
+    expect(child.status).toBe("error");
+    expect(child.error).toContain(depId);
+    expect(completed?.id).toBe(childId);
+  });
+});
